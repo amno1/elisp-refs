@@ -32,10 +32,9 @@
 
 ;;; Code:
 
-(require 'dash)
-(require 's)
 (require 'format)
 (eval-when-compile (require 'cl-lib))
+(eval-when-compile (require 'subr-x))
 
 ;;; Internal
 
@@ -52,7 +51,7 @@
     (push (format "%d" number) parts)
     (concat
      (if (< integer 0) "-" "")
-     (s-join "," parts))))
+     (string-join parts ","))))
 
 (defsubst elisp-refs--start-pos (end-pos)
   "Find the start position of form ending at END-POS
@@ -71,18 +70,18 @@ Not recursive, so we don't consider subelements of nested sexps."
   (let ((positions nil))
     (with-current-buffer buffer
       (condition-case _err
-	  (catch 'done
+          (catch 'done
             (while t
               (let* ((sexp-end-pos (let ((parse-sexp-ignore-comments t))
                                      (scan-sexps start-pos 1))))
-		;; If we've reached a sexp beyond the range requested,
-		;; or if there are no sexps left, we're done.
-		(when (or (null sexp-end-pos) (> sexp-end-pos end-pos))
+                ;; If we've reached a sexp beyond the range requested,
+                ;; or if there are no sexps left, we're done.
+                (when (or (null sexp-end-pos) (> sexp-end-pos end-pos))
                   (throw 'done nil))
-		;; Otherwise, this sexp is in the range requested.
-		(push (list (elisp-refs--start-pos sexp-end-pos) sexp-end-pos)
+                ;; Otherwise, this sexp is in the range requested.
+                (push (list (elisp-refs--start-pos sexp-end-pos) sexp-end-pos)
                       positions)
-		(setq start-pos sexp-end-pos))))
+                (setq start-pos sexp-end-pos))))
         ;; Terminate when we see "Containing expression ends prematurely"
         (scan-error nil)))
     (nreverse positions)))
@@ -154,7 +153,7 @@ START-POS and END-POS should be the position of FORM within BUFFER."
     (list (list form start-pos end-pos)))
    ;; Otherwise, recurse on the subforms.
    ((consp form)
-    (let ((matches nil)
+    (let ((matches nil) (it-index 0)
           ;; Find the positions of the subforms.
           (subforms-positions
            (if (eq (car-safe form) '\`)
@@ -166,19 +165,22 @@ START-POS and END-POS should be the position of FORM within BUFFER."
              ;; Calculate the positions after the opening paren.
              (elisp-refs--sexp-positions buffer (1+ start-pos) end-pos))))
       ;; For each subform, recurse if it's a list, or a matching symbol.
-      (--each (-zip form subforms-positions)
-        (-let [(subform subform-start subform-end) it]
+      (dolist (it (cl-loop for f in form for p in subforms-positions
+                           collect (cons f p)))
+        (let ((subform (nth 0 it))
+              (subform-start (nth 1 it))
+              (subform-end (nth 2 it)))
           (when (or
                  (and (consp subform) (elisp-refs--proper-list-p subform))
                  (and (symbolp subform) (eq subform symbol)))
-            (-when-let (subform-matches
-                        (elisp-refs--walk
-                         buffer subform
-                         subform-start subform-end
-                         symbol match-p
-                         (cons (cons (car-safe form) it-index) path)))
-              (push subform-matches matches)))))
-
+            (let ((subform-matches
+                  (elisp-refs--walk
+                   buffer subform
+                   subform-start subform-end
+                   symbol match-p
+                   (cons (cons (car-safe form) it-index) path))))
+                   (when subform-matches (push subform-matches matches)))))
+        (setq it-index (1+ it-index)))
       ;; Concat the results from all the subforms.
       (apply #'append (nreverse matches))))))
 
@@ -217,7 +219,8 @@ START-POS and END-POS should be the position of FORM within BUFFER."
    ((eq (car form) symbol)
     t)
    ;; (foo ... #'SYMBOL ...)
-   ((--any-p (equal it (list 'function symbol)) form)
+   (;;(--any-p (equal it (list 'function symbol)) form)
+    (cl-loop for it in form if (equal it (list 'function symbol)) return it)
     t)
    ;; (funcall 'SYMBOL ...)
    ((and (eq (car form) 'funcall)
@@ -300,30 +303,32 @@ contain SYMBOL where MATCH-P returns t.
 
 For every matching form found, we return the form itself along
 with its start and end position."
-  (-non-nil
-   (--mapcat
-    (-let [(form start-pos end-pos symbol-positions _read-start-pos) it]
-      ;; Optimisation: don't bother walking a form if contains no
-      ;; references to the symbol we're looking for.
-      (when (assq symbol symbol-positions)
-        (elisp-refs--walk buffer form start-pos end-pos symbol match-p)))
-    (elisp-refs--read-all-buffer-forms buffer))))
+  (let (forms)
+    (dolist (it (elisp-refs--read-all-buffer-forms buffer))
+      (let ((form (nth 0 it)) (start-pos (nth 1 it))
+            (end-pos (nth 2 it)) (symbol-positions (nth 3 it)))
+        ;; Optimisation: don't bother walking a form if contains no
+        ;; references to the symbol we're looking for.
+        (when (assq symbol symbol-positions)
+          (setq forms (nconc forms
+                             (elisp-refs--walk buffer form start-pos
+                                               end-pos symbol match-p))))))
+    (delq nil forms)))
 
 (defun elisp-refs--read-and-find-symbol (buffer symbol)
   "Read all the forms in BUFFER, and return a list of all
 positions of SYMBOL."
-  (-non-nil
-   (--mapcat
-    (-let [(_ _ _ symbol-positions read-start-pos) it]
-      (--map
-       (-let [(sym . offset) it]
-         (when (eq sym symbol)
-           (-let* ((start-pos (+ read-start-pos offset))
-                   (end-pos (+ start-pos (length (symbol-name sym)))))
-             (list sym start-pos end-pos))))
-       symbol-positions))
+  (let (positions)
+    (dolist (it (elisp-refs--read-all-buffer-forms buffer))
+      (let ((symbol-positions (nth 3 it)) (read-start-pos (nth 4 it)))
+        (dolist (pos symbol-positions)
+          (let ((sym (car pos)) (offset (cdr pos)))
+            (when (eq sym symbol)
+              (let ((start (+ read-start-pos offset))
+                    (end (+ read-start-pos offset (length (symbol-name sym)))))
+              (push (list sym start end) positions)))))))
+    (delq nil (nreverse positions))))
 
-    (elisp-refs--read-all-buffer-forms buffer))))
 
 (defun elisp-refs--filter-obarray (pred)
   "Return a list of all the items in `obarray' where PRED returns t."
@@ -337,16 +342,14 @@ positions of SYMBOL."
 (defun elisp-refs--loaded-paths ()
   "Return a list of all files that have been loaded in Emacs.
 Where the file was a .elc, return the path to the .el file instead."
-  (let ((elc-paths (-non-nil (mapcar #'-first-item load-history))))
-    (-non-nil
-     (--map
+  (let ((elc-paths (delq nil (mapcar #'car load-history)))
+        files)
+    (dolist (it elc-paths)
       (let ((el-name (format "%s.el" (file-name-sans-extension it)))
             (el-gz-name (format "%s.el.gz" (file-name-sans-extension it))))
-        (cond ((file-exists-p el-name) el-name)
-              ((file-exists-p el-gz-name) el-gz-name)
-              ;; Ignore files where we can't find a .el file.
-              (t nil)))
-      elc-paths))))
+        (cond ((file-exists-p el-name) (push el-name files))
+              ((file-exists-p el-gz-name) (push el-gz-name files)))))
+      files))
 
 (defun elisp-refs--contents-buffer (path)
   "Read PATH into a disposable buffer, and return it.
@@ -384,7 +387,7 @@ don't want to create lots of temporary buffers.")
           (generate-new-buffer " *refs-highlighting*"))
     (with-current-buffer elisp-refs--highlighting-buffer
       (delay-mode-hooks (emacs-lisp-mode))))
-  
+
   (with-current-buffer elisp-refs--highlighting-buffer
     (erase-buffer)
     (insert str)
@@ -398,14 +401,14 @@ don't want to create lots of temporary buffers.")
   "Replace tabs in STRING with spaces."
   ;; This is important for unindenting, as we may unindent by less
   ;; than one whole tab.
-  (s-replace "\t" (s-repeat tab-width " ") string))
+  (replace-regexp-in-string "\t" (make-string tab-width ?\s) string))
 
 (defun elisp-refs--lines (string)
   "Return a list of all the lines in STRING.
 'a\nb' -> ('a\n' 'b')"
   (let ((lines nil))
     (while (> (length string) 0)
-      (let ((index (s-index-of "\n" string)))
+      (let ((index (string-match-p "\n" string)))
         (if index
             (progn
               (push (substring string 0 (1+ index)) lines)
@@ -427,11 +430,11 @@ at least one line has no indent.
 
 STRING should have a 'elisp-refs-start-pos property. The returned
 string will have this property updated to reflect the unindent."
-  (let* ((lines (s-lines string))
-         ;; Get the leading whitespace for each line.
-         (indents (--map (car (s-match (rx bos (+ whitespace)) it))
-                         lines))
-         (min-indent (-min (--map (length it) indents))))
+  (let* ((lines (split-string string "\n"))
+         (min-indent most-positive-fixnum) (indent 0))
+    (dolist (line lines)
+      (setq indent (or (string-match-p "[^[:blank:]]" line) 0))
+      (if (> min-indent indent) (setq min-indent indent)))
     (propertize
      (elisp-refs--map-lines
       string
@@ -466,11 +469,10 @@ propertize them."
                     (elisp-refs--syntax-highlight (buffer-substring start-pos end-pos))
                     (propertize after-match
                                 'face 'font-lock-comment-face))))
-        (-> text
-            (elisp-refs--replace-tabs)
-            (elisp-refs--unindent-rigidly)
-            (propertize 'elisp-refs-start-pos expanded-start-pos
-                        'elisp-refs-path elisp-refs--path))))))
+        (setq text (elisp-refs--replace-tabs text)
+              text (elisp-refs--unindent-rigidly text)
+              text (propertize text 'elisp-refs-start-pos expanded-start-pos
+                               'elisp-refs-path elisp-refs--path))))))
 
 (defun elisp-refs--find-file (button)
   "Open the file referenced by BUTTON."
@@ -542,8 +544,13 @@ KIND should be 'function, 'macro, 'variable, 'special or 'symbol."
                                    (elisp-refs--pluralize searched-file-count "loaded file")
                                    (elisp-refs--path-button (file-name-as-directory prefix)))
                          (format "Searched all %s loaded in Emacs."
-                                 (elisp-refs--pluralize searched-file-count "file")))))
-    (s-word-wrap 70 (format "%s %s" found-str searched-str))))
+                                 (elisp-refs--pluralize searched-file-count
+                                                        "file")))))
+    (with-temp-buffer
+      (insert found-str " " searched-str)
+      (let ((fill-column 70))
+        (fill-region (point-min) (point-max)))
+      (buffer-string))))
 
 ;; TODO: if we have multiple matches on one line, we repeatedly show
 ;; that line. That's slightly confusing.
@@ -560,20 +567,20 @@ render a friendly results buffer."
         (insert
          (elisp-refs--format-count
           description
-          (-sum (--map (length (car it)) results))
+          (apply #'+ (cl-loop for it in results collect (length (car it))))
           (length results)
           searched-file-count
           prefix)
          "\n\n")
         ;; Insert the results.
-        (--each results
-          (-let* (((forms . buf) it)
+        (dolist (result results)
+          (let* ((forms (car result)) (buf (cdr result))
                   (path (with-current-buffer buf elisp-refs--path)))
             (insert
              (propertize "File: " 'face 'bold)
              (elisp-refs--path-button path) "\n")
-            (--each forms
-              (-let [(_ start-pos end-pos) it]
+            (dolist (it forms)
+              (let ((start-pos (nth 1 it)) (end-pos (nth 2 it)))
                 (insert (elisp-refs--containing-lines buf start-pos end-pos)
                         "\n")))
             (insert "\n")))
@@ -619,17 +626,19 @@ MATCH-FN should return a list where each element takes the form:
       forms-and-bufs)))
 
 (defun elisp-refs--search (symbol description match-fn &optional path-prefix)
-  "Search for references to SYMBOL in all loaded files, by calling MATCH-FN on each buffer.
-If PATH-PREFIX is given, limit to loaded files whose path starts with that prefix.
+  "Find references to SYMBOL in all loaded files; call MATCH-FN on each buffer.
+When PATH-PREFIX, limit to loaded files whose path starts with that prefix.
 
 Display the results in a hyperlinked buffer.
 
 MATCH-FN should return a list where each element takes the form:
 \(form start-pos end-pos)."
   (let* ((loaded-paths (elisp-refs--loaded-paths))
-         (matching-paths (if path-prefix
-                             (--filter (s-starts-with? path-prefix it) loaded-paths)
-                           loaded-paths))
+         (matching-paths
+          (if path-prefix
+              (cl-loop for it in loaded-paths
+                       if (string-prefix-p path-prefix it) collect it)
+            loaded-paths))
          (loaded-src-bufs (mapcar #'elisp-refs--contents-buffer matching-paths)))
     ;; Use unwind-protect to ensure we always cleanup temporary
     ;; buffers, even if the user hits C-g.
@@ -640,7 +649,7 @@ MATCH-FN should return a list where each element takes the form:
             (elisp-refs--show-results symbol description forms-and-bufs
                                       (length loaded-src-bufs) path-prefix)))
       ;; Clean up temporary buffers.
-      (--each loaded-src-bufs (kill-buffer it)))))
+      (dolist (it loaded-src-bufs) (kill-buffer it)))))
 
 (defun elisp-refs--completing-read-symbol (prompt &optional filter)
   "Read an interned symbol from the minibuffer,
@@ -654,8 +663,8 @@ t."
      (completing-read prompt
                       (elisp-refs--filter-obarray filter)
                       nil nil nil nil
-                      (-if-let (sym (thing-at-point 'symbol))
-                          (when (funcall filter (read sym))
+                      (let ((sym (thing-at-point 'symbol)))
+                        (and sym (funcall filter (read sym))
                             sym))))))
 
 ;;; Commands
